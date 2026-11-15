@@ -15,7 +15,7 @@ l'intera configurazione come i PCF).
 from __future__ import annotations
 
 import logging
-from datetime import date
+from datetime import date, timedelta
 
 import voluptuous as vol
 from homeassistant.config_entries import ConfigEntry
@@ -26,6 +26,7 @@ from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.start import async_at_started
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
+from homeassistant.util import dt as dt_util
 
 from .const import CONF_CLIENT_ID, CONF_PODS, CONF_SECRET_ID, DOMAIN
 from .distributors import DISTRIBUTOR_REGISTRY
@@ -53,6 +54,7 @@ _COORDINATOR_CON_POD = (
 
 SERVICE_RECUPERA_TICKET = "recupera_ticket"
 SERVICE_RECUPERA_STORICO = "recupera_storico"
+SERVICE_DUMP_FASCE = "dump_fasce"  # TEMPORANEA, solo diagnostica (branch debug/dump-fasce)
 
 SCHEMA_RECUPERA_STORICO = vol.Schema({
     vol.Required("data_da"): cv.date,
@@ -187,6 +189,63 @@ async def _async_registra_servizi(hass: HomeAssistant) -> None:
         else:
             await coordinator.async_recupera_storico(call.data["data_da"], call.data["data_a"])
 
+    async def _dump_fasce(call: ServiceCall) -> None:
+        """TEMPORANEA: mostra le risposte grezze di 'reading' e 'time of use'
+        di E-Distribuzione per il mese precedente, per vedere come sono fatte
+        le fasce. Non importa nulla."""
+        import json  # noqa: PLC0415
+
+        from homeassistant.components import persistent_notification  # noqa: PLC0415
+
+        coordinator, pod = _risolvi_coordinator_e_pod_da_device(hass, call.data["device_id"])
+        if not isinstance(coordinator, EdistribuzioneCoordinator) or pod is None:
+            raise HomeAssistantError("Scegli un dispositivo POD di E-Distribuzione.")
+
+        await coordinator._async_ensure_token()  # noqa: SLF001
+        api = coordinator.api
+        oggi = dt_util.now().date()
+        fine = oggi.replace(day=1)  # 1 del mese corrente
+        inizio = (fine - timedelta(days=1)).replace(day=1)  # 1 del mese precedente
+        fine_mese = fine - timedelta(days=1)
+
+        async def _chiama(nome, coro):
+            try:
+                return await coro
+            except Exception as err:  # noqa: BLE001 - e' diagnostica
+                return {"errore": f"{type(err).__name__}: {err}"}
+
+        risultato = {
+            "periodo": [inizio.isoformat(), fine.isoformat()],
+            "reading": await _chiama("reading", api.async_get_reading(pod, inizio, fine)),
+            "time_of_use_A1": await _chiama(
+                "tou", api.async_get_monthly_time_of_use(pod, inizio, fine_mese, "A1")
+            ),
+            "time_of_use_A2": await _chiama(
+                "tou2", api.async_get_monthly_time_of_use(pod, inizio, fine_mese, "A2")
+            ),
+        }
+        testo = json.dumps(risultato, indent=2, ensure_ascii=False).replace(pod, "ITXXXXXXXXXXXXX")
+
+        def _scrivi() -> str:
+            percorso = hass.config.path("contatore_letture_dump_fasce.json")
+            with open(percorso, "w", encoding="utf-8") as f:
+                f.write(testo)
+            return percorso
+
+        percorso = await hass.async_add_executor_job(_scrivi)
+        persistent_notification.async_create(
+            hass,
+            f"Salvato anche in {percorso}\n\n```json\n{testo[:15000]}\n```",
+            title="Contatore letture: dump fasce",
+            notification_id="contatore_letture_dump_fasce",
+        )
+
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_DUMP_FASCE,
+        _dump_fasce,
+        schema=vol.Schema({vol.Required("device_id"): cv.string}),
+    )
     hass.services.async_register(
         DOMAIN, SERVICE_RECUPERA_TICKET, _recupera_ticket, schema=SCHEMA_RECUPERA_TICKET
     )

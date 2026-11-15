@@ -96,3 +96,17 @@ recupera_storico:
       example: "2026-07-31"
       selector:
         date:
+
+dump_fasce:
+  name: Dump fasce (diagnostica temporanea)
+  description: >-
+    Mostra in una notifica le risposte grezze di E-Distribuzione per le fasce
+    del mese precedente (reading e time of use). Non importa nulla.
+  fields:
+    device_id:
+      name: POD
+      description: Il dispositivo POD E-Distribuzione.
+      required: true
+      selector:
+        device:
+          integration: contatore_letture
