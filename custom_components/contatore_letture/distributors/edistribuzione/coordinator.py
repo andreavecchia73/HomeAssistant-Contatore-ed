@@ -459,14 +459,19 @@ class EdistribuzioneCoordinator(DataUpdateCoordinator[dict]):
             if fasce is not None:
                 attuali[grandezza] = fasce
 
-    async def _async_importa_immissione(self, pod: str, data_da: date, data_a: date) -> None:
+    async def _async_importa_immissione(
+        self, pod: str, data_da: date, data_a: date
+    ) -> tuple[date, float] | None:
         """Importa l'immissione (A2) del periodo, se il POD ha un impianto.
 
         Non tocca la coda e non fa fallire l'aggiornamento: il giorno e' dato
         per ricevuto in base al prelievo (A1), un errore qui e' solo un
-        warning. Sul POD di produzione l'immissione e' la produzione solare."""
+        warning. Sul POD di produzione l'immissione e' la produzione solare.
+
+        Restituisce (ultimo giorno ricevuto, kWh di quel giorno), o None se
+        non c'e' nulla da importare."""
         if pod not in await self._async_pod_con_impianto():
-            return
+            return None
         try:
             curva = await self._api.async_get_daily_load_profile(
                 pod, data_da, data_a, magnitude=MAGNITUDE_IMMISSIONE
@@ -479,11 +484,18 @@ class EdistribuzioneCoordinator(DataUpdateCoordinator[dict]):
                 data_a,
                 err,
             )
-            return
-        if _curva_ha_dati(curva):
-            await async_import_curva_giornaliera(
-                self.hass, pod, curva, magnitude=MAGNITUDE_IMMISSIONE
-            )
+            return None
+        if not _curva_ha_dati(curva):
+            return None
+        await async_import_curva_giornaliera(
+            self.hass, pod, curva, magnitude=MAGNITUDE_IMMISSIONE
+        )
+        ricevuti = _giorni_ricevuti(curva)
+        if not ricevuti:
+            return None
+        ultimo = max(ricevuti)
+        kwh = _kwh_del_giorno(curva, ultimo)
+        return (ultimo, kwh) if kwh is not None else None
 
     # ------------------------------------------------------------------
     # Ciclo di polling automatico
@@ -500,6 +512,8 @@ class EdistribuzioneCoordinator(DataUpdateCoordinator[dict]):
             richiesta = await self._prossima_richiesta(pod)
             kwh_ultimo_giorno_importato = None
             ultimo_giorno_importato = None
+            kwh_ultimo_giorno_immesso = None
+            ultimo_giorno_immesso = None
             ultimo_giorno_richiesto = None
             if richiesta is not None:
                 data_da, data_a = richiesta
@@ -537,7 +551,10 @@ class EdistribuzioneCoordinator(DataUpdateCoordinator[dict]):
 
                     # Senza prelievo non c'e' ancora nulla da abbinare: il
                     # periodo e' in coda e l'immissione si chiede con lui.
-                    await self._async_importa_immissione(pod, data_da, data_a)
+                    immissione = await self._async_importa_immissione(pod, data_da, data_a)
+                    if immissione is not None:
+                        ultimo_giorno_immesso = immissione[0].isoformat()
+                        kwh_ultimo_giorno_immesso = immissione[1]
                 else:
                     for giorno in _giorni_nel_periodo(data_da, data_a):
                         self._accoda_giorno(pod, giorno)
@@ -566,6 +583,8 @@ class EdistribuzioneCoordinator(DataUpdateCoordinator[dict]):
                 ),
                 "kwh_ultimo_giorno_importato": kwh_ultimo_giorno_importato,
                 "ultimo_giorno_importato": ultimo_giorno_importato,
+                "kwh_ultimo_giorno_immesso": kwh_ultimo_giorno_immesso,
+                "ultimo_giorno_immesso": ultimo_giorno_immesso,
             }
 
         return {"by_pod": by_pod}
